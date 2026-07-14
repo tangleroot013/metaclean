@@ -2,6 +2,7 @@
 """metaclean.py — TUI metadata cleaner: walk, select, clean, resave."""
 import curses
 import os
+import glob
 import shutil
 import zipfile
 from pathlib import Path
@@ -9,12 +10,45 @@ from datetime import datetime
 
 OUTPUT_DIR = Path.home() / "MetaCleaned"
 
+# ---------- auto-media finder logic ----------
+def get_latest_media_file() -> Path or None:
+    """
+    Scans standard directories (Downloads, Pictures, Desktop)
+    and returns the Path object of the most recently saved media file.
+    """
+    extensions = {'*.jpg', '*.jpeg', '*.png', '*.gif', '*.mp4', '*.mov', '*.pdf'}
+    home_dir = Path.home()
+    
+    folders_to_check = [
+        home_dir / 'Downloads',
+        home_dir / 'Pictures',
+        home_dir / 'Desktop'
+    ]
+    
+    all_media_files = []
+    
+    for folder in folders_to_check:
+        if not folder.exists():
+            continue
+            
+        for ext in extensions:
+            all_media_files.extend(folder.glob(ext))
+            all_media_files.extend(folder.glob(ext.upper()))
+            
+    if not all_media_files:
+        return None
+        
+    return max(all_media_files, key=os.path.getmtime)
+
 # ---------- curses file browser ----------
 def browse(stdscr):
     curses.curs_set(0)
     curses.use_default_colors()
     cwd = Path.home()
     idx = 0
+    
+    latest_media = get_latest_media_file()
+    
     while True:
         entries = sorted(
             [".."] + [e.name for e in cwd.iterdir()],
@@ -22,22 +56,34 @@ def browse(stdscr):
         )
         stdscr.clear()
         h, w = stdscr.getmaxyx()
+        
         stdscr.addstr(0, 0, f"metaclean :: {cwd}"[: w - 1], curses.A_BOLD)
         stdscr.addstr(1, 0, "up/down move  ENTER open/select  BACKSPACE up  q quit"[: w - 1])
-        for i, name in enumerate(entries[: h - 3]):
+        
+        offset = 3
+        if latest_media:
+            shortcut_text = f"✨ [L] Quick Load Latest Media: {latest_media.name} (from {latest_media.parent.name})"
+            stdscr.addstr(2, 0, shortcut_text[: w - 1], curses.A_STANDOUT)
+            offset = 4
+            
+        for i, name in enumerate(entries[: h - offset - 1]):
             full = cwd / name if name != ".." else cwd.parent
             tag = "/" if name != ".." and full.is_dir() else ""
             attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
-            stdscr.addstr(i + 3, 2, f"{name}{tag}"[: w - 3], attr)
+            stdscr.addstr(i + offset, 2, f"{name}{tag}"[: w - 3], attr)
+            
         stdscr.refresh()
         key = stdscr.getch()
+        
         if key == curses.KEY_UP and idx > 0:
             idx -= 1
-        elif key == curses.KEY_DOWN and idx < len(entries[: h - 3]) - 1:
+        elif key == curses.KEY_DOWN and idx < len(entries[: h - offset - 1]) - 1:
             idx += 1
         elif key in (curses.KEY_BACKSPACE, 127, 8):
             cwd = cwd.parent
             idx = 0
+        elif key in (ord("l"), ord("L")) and latest_media:
+            return latest_media
         elif key in (ord("q"), 27):
             return None
         elif key in (10, 13, curses.KEY_ENTER):
@@ -70,7 +116,7 @@ def clean_jpeg(data: bytes) -> bytes:
             out += data[i:]
             break
         seg_len = int.from_bytes(data[i + 2:i + 4], "big")
-        if marker in (0xE1, 0xE2, 0xED, 0xEE):  # EXIF / IPTC / etc
+        if marker in (0xE1, 0xE2, 0xED, 0xEE):
             i += 2 + seg_len
             continue
         out += data[i:i + 2 + seg_len]
