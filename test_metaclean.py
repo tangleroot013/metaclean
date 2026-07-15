@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Test suite for metaclean.py core logic — binary parsers, manifest, idempotency, edge cases."""
+import io
+import json
+import shutil
+import struct
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+
+import metaclean
+
+
+def png_chunk(ctype: bytes, data: bytes) -> bytes:
+    length = struct.pack(">I", len(data))
+    crc = b"\x00\x00\x00\x00"  # dummy — parser doesn't validate CRC
+    return length + ctype + data + crc
+
+
+class TestJpegCleaning(unittest.TestCase):
+    def test_strips_exif_keeps_comment_and_scan_data(self):
+        app1 = b"\xff\xe1" + struct.pack(">H", 2 + 6) + b"EXIF12"
+        com = b"\xff\xfe" + struct.pack(">H", 2 + 5) + b"HELLO"
+        sos_and_scan = b"\xff\xda" + b"\x00\x0c" + b"\x00" * 10
+        eoi = b"\xff\xd9"
+        data = b"\xff\xd8" + app1 + com + sos_and_scan + eoi
+
+        cleaned, removed = metaclean.clean_jpeg(data)
+
+        self.assertIn("EXIF", removed)
+        self.assertNotIn(b"EXIF12", cleaned)
+        self.assertIn(b"HELLO", cleaned)
+        self.assertTrue(cleaned.startswith(b"\xff\xd8"))
+        self.assertTrue(cleaned.endswith(b"\xff\xd9"))
+
+    def test_non_jpeg_input_passthrough(self):
+        data = b"not a jpeg at all"
+        cleaned, removed = metaclean.clean_jpeg(data)
+        self.assertEqual(cleaned, data)
+        self.assertEqual(removed, [])
+
+    def test_truncated_jpeg_does_not_crash(self):
+        data = b"\xff\xd8\xff"
+        cleaned, removed = metaclean.clean_jpeg(data)
+        self.assertTrue(cleaned.startswith(b"\xff\xd8"))
+
+    def test_empty_input_does_not_crash(self):
+        cleaned, removed = metaclean.clean_jpeg(b"")
+        self.assertEqual(cleaned, b"")
+        self.assertEqual(removed, [])
+
+    def test_app1_length_exceeds_actual_data_does_not_crash(self):
+        data = b"\xff\xd8\xff\xe1\xff\xff" + b"short"
+        try:
+            cleaned, removed = metaclean.clean_jpeg(data)
+        except Exception as e:
+            self.fail(f"clean_jpeg raised on malformed input: {e}")
+
+
+class TestPngCleaning(unittest.TestCase):
+    def test_strips_text_and_time_keeps_ihdr_idat_iend(self):
+        sig = b"\x89PNG\r\n\x1a\n"
+        ihdr = png_chunk(b"IHDR", b"\x00" * 13)
+        text = png_chunk(b"tEXt", b"Author\x00SomeName")
+        time_chunk = png_chunk(b"tIME", b"\x07\xe6\x01\x01\x00\x00\x00")
+        idat = png_chunk(b"IDAT", b"\x01\x02\x03\x04")
+        iend = png_chunk(b"IEND", b"")
+        data = sig + ihdr + text + time_chunk + idat + iend
+
+        cleaned, removed = metaclean.clean_png(data)
+
+        self.assertIn("tEXt", removed)
+        self.assertIn("tIME", removed)
+        self.assertNotIn(b"SomeName", cleaned)
+        self.assertIn(b"IHDR", cleaned)
+        self.assertIn(b"IDAT", cleaned)
+        self.assertTrue(cleaned.endswith(png_chunk(b"IEND", b"")))
+
+    def test_non_png_input_passthrough(self):
+        data = b"definitely not a png"
+        cleaned, removed = metaclean.clean_png(data)
+        self.assertEqual(cleaned, data)
+        self.assertEqual(removed, [])
+
+    def test_empty_input_does_not_crash(self):
+        cleaned, removed = metaclean.clean_png(b"")
+        self.assertEqual(cleaned, b"")
+        self.assertEqual(removed, [])
+
+
+class TestOfficeCleaning(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.src = self.tmpdir / "test.docx"
+        self.dst = self.tmpdir / "test_clean.docx"
+        with zipfile.ZipFile(self.src, "w") as z:
+            z.writestr("word/document.xml", "<w:body>Real content</w:body>")
+            z.writestr("docProps/core.xml", "<dc:creator>bilbywilby</dc:creator>")
+            z.writestr("docProps/app.xml", "<Application>Microsoft Word</Application>")
+            z.writestr("docProps/custom.xml", "<property>secret</property>")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_strips_docprops_keeps_content(self):
+        removed = metaclean.clean_office(self.src, self.dst)
+
+        self.assertIn("docProps/core.xml", removed)
+        self.assertIn("docProps/app.xml", removed)
+        self.assertIn("docProps/custom.xml", removed)
+
+        with zipfile.ZipFile(self.dst) as z:
+            names = z.namelist()
+            self.assertIn("word/document.xml", names)
+            self.assertNotIn("docProps/core.xml", names)
+            content = z.read("word/document.xml").decode()
+            self.assertIn("Real content", content)
+
+
+class TestManifestIdempotency(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self._orig_output_dir = metaclean.OUTPUT_DIR
+        self._orig_manifest = metaclean.MANIFEST
+        metaclean.OUTPUT_DIR = self.tmpdir / "MetaCleaned"
+        metaclean.MANIFEST = metaclean.OUTPUT_DIR / ".manifest.json"
+
+    def tearDown(self):
+        metaclean.OUTPUT_DIR = self._orig_output_dir
+        metaclean.MANIFEST = self._orig_manifest
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_manifest_roundtrip(self):
+        m = metaclean.load_manifest()
+        self.assertEqual(m, {})
+        m["abc123"] = {"output": "/some/path.jpg", "fields_removed": ["EXIF"]}
+        metaclean.save_manifest(m)
+        reloaded = metaclean.load_manifest()
+        self.assertEqual(reloaded["abc123"]["fields_removed"], ["EXIF"])
+
+    def test_corrupt_manifest_does_not_crash(self):
+        metaclean.OUTPUT_DIR.mkdir(exist_ok=True)
+        metaclean.MANIFEST.write_text("{not valid json")
+        m = metaclean.load_manifest()
+        self.assertEqual(m, {})
+
+    def test_deterministic_dest_same_hash_same_path(self):
+        d1 = metaclean.deterministic_dest("photo", ".jpg", "abcdef1234567890")
+        d2 = metaclean.deterministic_dest("photo", ".jpg", "abcdef1234567890")
+        self.assertEqual(d1, d2)
+
+    def test_deterministic_dest_different_hash_different_path(self):
+        d1 = metaclean.deterministic_dest("photo", ".jpg", "aaaaaaaa00000000")
+        d2 = metaclean.deterministic_dest("photo", ".jpg", "bbbbbbbb00000000")
+        self.assertNotEqual(d1, d2)
+
+    def test_sha256_stable_for_identical_bytes(self):
+        data = b"identical content"
+        self.assertEqual(metaclean.sha256_of(data), metaclean.sha256_of(data))
+
+    def test_sha256_differs_for_different_bytes(self):
+        self.assertNotEqual(metaclean.sha256_of(b"a"), metaclean.sha256_of(b"b"))
+
+
+class TestHumanAgo(unittest.TestCase):
+    def test_seconds(self):
+        import time
+        self.assertTrue(metaclean.human_ago(time.time() - 5).endswith("s ago"))
+
+    def test_minutes(self):
+        import time
+        self.assertTrue(metaclean.human_ago(time.time() - 300).endswith("m ago"))
+
+    def test_hours(self):
+        import time
+        self.assertTrue(metaclean.human_ago(time.time() - 7200).endswith("h ago"))
+
+    def test_days(self):
+        import time
+        self.assertTrue(metaclean.human_ago(time.time() - 200000).endswith("d ago"))
+
+
+class TestSupportedExtensions(unittest.TestCase):
+    def test_common_types_present(self):
+        for ext in (".jpg", ".png", ".docx", ".pdf", ".mp3", ".mp4"):
+            self.assertIn(ext, metaclean.SUPPORTED)
+
+    def test_unsupported_type_rejected(self):
+        self.assertNotIn(".exe", metaclean.SUPPORTED)
+        self.assertNotIn(".txt", metaclean.SUPPORTED)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
