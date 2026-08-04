@@ -3,3 +3,6 @@ __pycache__/
 venv/
 *.bak
 .manifest.json
+
+# one-off local setup/fix scripts -- never tracked
+/*.sh
